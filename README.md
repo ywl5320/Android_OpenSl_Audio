@@ -1,0 +1,2 @@
+# Android_OpenSl_Audio
+Android利用OpenSL ES通过assets、Uri和pcm文件的方式来播放音频。
