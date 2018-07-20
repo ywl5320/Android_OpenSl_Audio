@@ -12,11 +12,14 @@
 
 #include <stdio.h>
 #include <malloc.h>
+#include "WlQueue.h"
+#include "pcmdata.h"
 
 //打印日志
 #include <android/log.h>
 #define LOGI(FORMAT,...) __android_log_print(ANDROID_LOG_INFO,"ywl5320",FORMAT,##__VA_ARGS__);
 #define LOGE(FORMAT,...) __android_log_print(ANDROID_LOG_ERROR,"ywl5320",FORMAT,##__VA_ARGS__);
+
 
 // 引擎接口
 SLObjectItf engineObject = NULL;
@@ -60,17 +63,17 @@ void createEngine()
     result = (*engineObject)->GetInterface(engineObject, SL_IID_ENGINE, &engineEngine);
 }
 
-
+extern "C"
 JNIEXPORT void JNICALL
 Java_com_ywl5320_openslaudio_MainActivity_playAudioByOpenSL_1assets(JNIEnv *env, jobject instance, jobject assetManager, jstring filename) {
 
     release();
-    const char *utf8 = (*env)->GetStringUTFChars(env, filename, NULL);
+    const char *utf8 = env->GetStringUTFChars(filename, NULL);
 
     // use asset manager to open asset by filename
     AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
     AAsset* asset = AAssetManager_open(mgr, utf8, AASSET_MODE_UNKNOWN);
-    (*env)->ReleaseStringUTFChars(env, filename, utf8);
+    env->ReleaseStringUTFChars(filename, utf8);
 
     // open asset as file descriptor
     off_t start, length;
@@ -135,12 +138,13 @@ Java_com_ywl5320_openslaudio_MainActivity_playAudioByOpenSL_1assets(JNIEnv *env,
 
 }
 
+extern "C"
 JNIEXPORT void JNICALL
 Java_com_ywl5320_openslaudio_MainActivity_playAudioByOpenSL_1uri(JNIEnv *env, jobject instance, jstring uri) {
     SLresult result;
     release();
     // convert Java string to UTF-8
-    const char *utf8 = (*env)->GetStringUTFChars(env, uri, NULL);
+    const char *utf8 = env->GetStringUTFChars(uri, NULL);
 
     //第一步，创建引擎
     createEngine();
@@ -178,7 +182,7 @@ Java_com_ywl5320_openslaudio_MainActivity_playAudioByOpenSL_1uri(JNIEnv *env, jo
     (void)result;
 
     // release the Java string and UTF-8
-    (*env)->ReleaseStringUTFChars(env, uri, utf8);
+    env->ReleaseStringUTFChars(uri, utf8);
 
     // realize the player
     result = (*uriPlayerObject)->Realize(uriPlayerObject, SL_BOOLEAN_FALSE);
@@ -272,7 +276,7 @@ void getPcmData(void **pcm)
     }
 }
 
-void * pcmBufferCallBack(SLAndroidBufferQueueItf bf, void * context)
+void pcmBufferCallBack(SLAndroidSimpleBufferQueueItf bf, void * context)
 {
     //assert(NULL == context);
     getPcmData(&buffer);
@@ -286,18 +290,19 @@ void * pcmBufferCallBack(SLAndroidBufferQueueItf bf, void * context)
     }
 }
 
+extern "C"
 JNIEXPORT void JNICALL
 Java_com_ywl5320_openslaudio_MainActivity_playAudioByOpenSL_1pcm(JNIEnv *env, jobject instance,
                                                                  jstring pamPath_) {
     release();
-    const char *pamPath = (*env)->GetStringUTFChars(env, pamPath_, 0);
+    const char *pamPath = env->GetStringUTFChars(pamPath_, 0);
     pcmFile = fopen(pamPath, "r");
     if(pcmFile == NULL)
     {
         LOGE("%s", "fopen file error");
         return;
     }
-    out_buffer = malloc(44100 * 2 * 2);
+    out_buffer = (uint8_t *) malloc(44100 * 2 * 2);
     SLresult result;
     // TODO
     //第一步，创建引擎
@@ -357,5 +362,103 @@ Java_com_ywl5320_openslaudio_MainActivity_playAudioByOpenSL_1pcm(JNIEnv *env, jo
 //    主动调用回调函数开始工作
     pcmBufferCallBack(pcmBufferQueue, NULL);
 
-    (*env)->ReleaseStringUTFChars(env, pamPath_, pamPath);
+    env->ReleaseStringUTFChars(pamPath_, pamPath);
+}
+
+
+
+
+WlQueue *wlQueue = NULL;
+pthread_t playpcm;
+
+void pcmBufferCallBack2(SLAndroidSimpleBufferQueueItf bf, void * context)
+{
+    pcmdata * data = wlQueue->getPcmdata();
+    if (NULL != data) {
+        (*pcmBufferQueue)->Enqueue(pcmBufferQueue, data->getData(), data->getSize());
+    }
+}
+
+void *createOpensl(void *data)
+{
+    SLresult result;
+    // TODO
+    //第一步，创建引擎
+    createEngine();
+
+    //第二步，创建混音器
+    const SLInterfaceID mids[1] = {SL_IID_ENVIRONMENTALREVERB};
+    const SLboolean mreq[1] = {SL_BOOLEAN_FALSE};
+    result = (*engineEngine)->CreateOutputMix(engineEngine, &outputMixObject, 1, mids, mreq);
+    (void)result;
+    result = (*outputMixObject)->Realize(outputMixObject, SL_BOOLEAN_FALSE);
+    (void)result;
+    result = (*outputMixObject)->GetInterface(outputMixObject, SL_IID_ENVIRONMENTALREVERB, &outputMixEnvironmentalReverb);
+    if (SL_RESULT_SUCCESS == result) {
+        result = (*outputMixEnvironmentalReverb)->SetEnvironmentalReverbProperties(
+                outputMixEnvironmentalReverb, &reverbSettings);
+        (void)result;
+    }
+    SLDataLocator_OutputMix outputMix = {SL_DATALOCATOR_OUTPUTMIX, outputMixObject};
+    SLDataSink audioSnk = {&outputMix, NULL};
+
+
+    // 第三步，配置PCM格式信息
+    SLDataLocator_AndroidSimpleBufferQueue android_queue={SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,2};
+    SLDataFormat_PCM pcm={
+            SL_DATAFORMAT_PCM,//播放pcm格式的数据
+            2,//2个声道（立体声）
+            SL_SAMPLINGRATE_44_1,//44100hz的频率
+            SL_PCMSAMPLEFORMAT_FIXED_16,//位数 16位
+            SL_PCMSAMPLEFORMAT_FIXED_16,//和位数一致就行
+            SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT,//立体声（前左前右）
+            SL_BYTEORDER_LITTLEENDIAN//结束标志
+    };
+    SLDataSource slDataSource = {&android_queue, &pcm};
+
+
+    const SLInterfaceID ids[3] = {SL_IID_BUFFERQUEUE, SL_IID_EFFECTSEND, SL_IID_VOLUME};
+    const SLboolean req[3] = {SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE};
+
+    result = (*engineEngine)->CreateAudioPlayer(engineEngine, &pcmPlayerObject, &slDataSource, &audioSnk, 3, ids, req);
+    //初始化播放器
+    (*pcmPlayerObject)->Realize(pcmPlayerObject, SL_BOOLEAN_FALSE);
+
+//    得到接口后调用  获取Player接口
+    (*pcmPlayerObject)->GetInterface(pcmPlayerObject, SL_IID_PLAY, &pcmPlayerPlay);
+
+//    注册回调缓冲区 获取缓冲队列接口
+    (*pcmPlayerObject)->GetInterface(pcmPlayerObject, SL_IID_BUFFERQUEUE, &pcmBufferQueue);
+    //缓冲接口回调
+    (*pcmBufferQueue)->RegisterCallback(pcmBufferQueue, pcmBufferCallBack2, NULL);
+//    获取音量接口
+    (*pcmPlayerObject)->GetInterface(pcmPlayerObject, SL_IID_VOLUME, &pcmPlayerVolume);
+
+//    获取播放状态接口
+    (*pcmPlayerPlay)->SetPlayState(pcmPlayerPlay, SL_PLAYSTATE_PLAYING);
+
+//    主动调用回调函数开始工作
+    pcmBufferCallBack2(pcmBufferQueue, NULL);
+
+    pthread_exit(&playpcm);
+}
+
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_ywl5320_openslaudio_MainActivity_sendPcmData(JNIEnv *env, jobject instance,
+                                                      jbyteArray data_, jint size) {
+    jbyte *data = env->GetByteArrayElements(data_, NULL);
+    // TODO
+    if(wlQueue == NULL)
+    {
+        wlQueue = new WlQueue();
+        pthread_create(&playpcm, NULL, createOpensl, NULL);
+    }
+    pcmdata * pdata = new pcmdata((char *) data, size);
+    wlQueue->putPcmdata(pdata);
+
+    LOGE("size is %d queue size is %d", size, wlQueue->getPcmdataSize());
+
+    env->ReleaseByteArrayElements(data_, data, 0);
 }
